@@ -175,7 +175,7 @@ class ACTTemporalEnsembler:
             self.ensembled_actions /= self.ensemble_weights_cumsum[self.ensembled_actions_count ]
             self.ensembled_actions_count = torch.clamp(self.ensembled_actions_count + 1, max=self.chunk_size) 
             action = self.ensembled_actions[:, 0]
-            self.ensembled_actions[:, :-1] = self.ensembled_actions[:, 1:]
+            self.ensembled_actions[:, :-1] = self.ensembled_actions[:, 1:].clone()
             self.ensembled_actions[:, -1] = action_chunk[:, -1]
             self.ensembled_actions_count[:-1] = self.ensembled_actions_count[1:]
             self.ensembled_actions_count[-1] = 1
