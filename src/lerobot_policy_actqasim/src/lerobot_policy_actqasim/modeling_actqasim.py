@@ -81,7 +81,7 @@ class ActQasimPolicy(PreTrainedPolicy):
         
         action_chunk = self.predict_action_chunk(batch)
         action = self.temporal_ensembler.update(action_chunk)
-        return action
+        return action_chunk[:, 0]
 
     def forward(self, batch: dict[str, torch.Tensor], use_mean=False) -> tuple[torch.Tensor, dict]:
         """Compute the training loss.
