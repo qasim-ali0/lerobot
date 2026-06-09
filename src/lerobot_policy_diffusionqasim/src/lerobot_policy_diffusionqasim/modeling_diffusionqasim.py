@@ -38,7 +38,7 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
             nn.Mish(),
             nn.Linear(128 * 4, 128),     # 1024 → 256
         )
-        self.T = 10
+        self.T = 16
         self.convblocks = nn.ModuleList([
             ConvBlock(),
             ConvBlock(),
