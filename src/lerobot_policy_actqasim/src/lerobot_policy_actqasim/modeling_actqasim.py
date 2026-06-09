@@ -167,7 +167,7 @@ class ACTTemporalEnsembler:
     def update(self, action_chunk):
         if self.absolute_time == 0:
             self.ensembled_actions = action_chunk[:, 1:].clone()
-            self.ensembled_actions_count = torch.ones((self.chunk_size -1 , 1), torch.int32, device=action_chunk.device)
+            self.ensembled_actions_count = torch.ones((self.chunk_size -1 , 1), dtype=torch.int32, device=action_chunk.device)
             action = action_chunk[:, 0]
         else:
             self.ensembled_actions *= self.ensemble_weights_cumsum[self.ensembled_actions_count - 1]
