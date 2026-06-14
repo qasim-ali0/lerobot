@@ -11,7 +11,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_IMAGES
 from .configuration_actqasim import ActQasimConfig
 from .blocks import *
-
+import numpy as np
 
 
 class AttentionEncoder(nn.Module):
@@ -123,7 +123,22 @@ class ActEncoderLayer(nn.Module):
         z = z + self.ff(self.norm2(z))
         return img_feats, state, z
 
+def create_sinusoidal_pos_embedding(num_positions: int, dimension: int):
+    """1D sinusoidal positional embeddings as in Attention is All You Need.
 
+    Args:
+        num_positions: Number of token positions required.
+    Returns: (num_positions, dimension) position embeddings (the first dimension is the batch dimension).
+
+    """
+
+    def get_position_angle_vec(position):
+        return [position / np.power(10000, 2 * (hid_j // 2) / dimension) for hid_j in range(dimension)]
+
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(num_positions)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
+    return torch.from_numpy(sinusoid_table).float()
 
 
 class ActQasimPolicy(PreTrainedPolicy):
@@ -150,7 +165,7 @@ class ActQasimPolicy(PreTrainedPolicy):
                 ActEncoderLayer(512, 8, 1576),
             )
         self.transformer_decoder = nn.ModuleList([
-            TransformerLayer(512, 8, 1576, cross_attention=True) for _ in range(2)
+            TransformerLayer(512, 8, 1576, cross_attention=True) for _ in range(1)
         ])
         self.action_embeds = nn.Parameter(torch.randn(self.config.chunk_size, 512))
         self.action_in_proj = nn.Linear(6, 512)
@@ -162,6 +177,7 @@ class ActQasimPolicy(PreTrainedPolicy):
         
     def reset(self):
         """Reset episode state."""
+        self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.temporal_ensembler.reset()
             
     def get_optim_params(self):
@@ -186,17 +202,24 @@ class ActQasimPolicy(PreTrainedPolicy):
         for layer in self.transformer_encoder:
             img_feats, state, z = layer(img_feats, state, z)
         x = torch.concat([img_feats, state[:, None], z[:, None]], 1)
-        action_embeds = self.action_embeds.unsqueeze(0).expand(B, -1, -1)
+        action_embeds = self.action_embeds 
+        action_embeds = action_embeds.unsqueeze(0).expand(B, -1, -1)
         for layer in self.transformer_decoder:
             action_embeds = layer(action_embeds, context=x)
         return self.action_out_proj(action_embeds)  # (B, chunk_size, action_dim)
 
     def select_action(self, batch: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         """Return a single action for the current timestep (called at inference)."""
+        # with torch.no_grad():
+        #     action_chunk = self.predict_action_chunk(batch)
+        #     action = self.temporal_ensembler.update(action_chunk)
+        #     return action
+        self.eval()
         with torch.no_grad():
-            action_chunk = self.predict_action_chunk(batch)
-            action = self.temporal_ensembler.update(action_chunk)
-        return action
+            if len(self._action_queue) == 0:
+                actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+                self._action_queue.extend(actions.transpose(0, 1))
+        return self._action_queue.popleft()
 
     def forward(self, batch: dict[str, torch.Tensor], use_mean=False) -> tuple[torch.Tensor, dict]:
         """Compute the training loss.
@@ -232,7 +255,8 @@ class ActQasimPolicy(PreTrainedPolicy):
         x = torch.concat([img_feats, state[:, None], z[:, None]], 1)
         
         # x = self.transformer_encoder(x)
-        action_embeds = self.action_embeds.unsqueeze(0).expand(B, -1, -1)
+        action_embeds = self.action_embeds 
+        action_embeds = action_embeds.unsqueeze(0).expand(B, -1, -1) 
         for layer in self.transformer_decoder:
             action_embeds = layer(action_embeds, context=x)
         actions_out = self.action_out_proj(action_embeds)
