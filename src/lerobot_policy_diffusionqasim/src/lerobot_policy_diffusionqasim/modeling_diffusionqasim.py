@@ -29,23 +29,15 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
         self.img_feat_proj = nn.Linear(512, 512)
-        self.action_in_proj = nn.Linear(6, 512)
         self.state_proj = nn.Linear(6, 512)
-        self.action_out_proj = nn.Linear(512, 6)
-        self.time_emb = step_encoder = nn.Sequential(
+        self.time_emb = nn.Sequential(
             SinusoidalTimeEmbedding(128),        # dsed = 256
             nn.Linear(128, 128 * 4),     # 256 → 1024
             nn.Mish(),
             nn.Linear(128 * 4, 128),     # 1024 → 256
         )
         self.T = 16
-        self.convblocks = nn.ModuleList([
-            ConvBlock(),
-            ConvBlock(),
-            ConvBlock(),
-            ConvBlock(),
-            ConvBlock()
-        ])
+        self.unet = ConditionalUNet1d()
         self.spatial_softmax = SpatialSoftmax(512, feature_dim=512)
         
         
@@ -64,14 +56,12 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
             self.vision_backbone(batch[next(iter(self.config.image_features))])["feature_map"]))
 
         x = torch.randn(B, self.config.chunk_size, 6, device=state.device)  # t=1: pure noise
-        dt = 1.0 / self.T 
+        dt = 1.0 / self.T
         for i in reversed(range(self.T)):                                   # integrate t: 1 → 0
             t = torch.full((B, 1), (i + 1) * dt, device=state.device)
-            a = self.action_in_proj(x)
             t_emb = self.time_emb(t * 1000)
-            for m in self.convblocks:
-                a = m(a, state, t_emb, img_embed)
-            v = self.action_out_proj(a)                                     # velocity = noise - action
+            cond = torch.concat([state, t_emb, img_embed], -1)             # (B, 1152)
+            v = self.unet(x, cond)                                          # velocity = noise - action
             x = x - dt * v                                                  # Euler step toward data
         return x
 
@@ -94,9 +84,8 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
         t = torch.rand(B, 1, device=batch[OBS_STATE].device)   # (B, 1)
         noise = torch.randn_like(batch[ACTION])
         tb = t[..., None]                                       # (B, 1, 1)
-        actions_noised = tb * noise + (1 - tb) * batch[ACTION]
-        actions = self.action_in_proj(actions_noised)
-        
+        actions_noised = tb * noise + (1 - tb) * batch[ACTION]  # (B, L, 6)
+
         state = self.state_proj(batch[OBS_STATE])
         images = [batch[key] for key in self.config.image_features]
         # then pass to backbone
@@ -106,12 +95,10 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
         img_embed = self.spatial_softmax(features[0])
         img_embed = self.img_feat_proj(img_embed)
 
-        t_emb = self.time_emb(t*1000)                     # (B, 512)
+        t_emb = self.time_emb(t*1000)                     # (B, 128)
+        cond = torch.concat([state, t_emb, img_embed], -1)  # (B, 1152)
 
-        for m in self.convblocks:
-            actions = m(actions, state, t_emb, img_embed)
-        
-        pred_noise = self.action_out_proj(actions)
+        pred_noise = self.unet(actions_noised, cond)      # (B, L, 6)
 
         l2_loss = torch.nn.functional.mse_loss(pred_noise, noise-batch[ACTION], reduction="none")
         valid = ~batch["action_is_pad"].unsqueeze(-1)  # (B, T, 1)
@@ -125,41 +112,99 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
             'loss': loss.item()
         }
     
-class ConvBlock(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mlp_gamma_scale = nn.Sequential(
-            nn.Linear(512+512+128, 512 * 2),
-            nn.Mish(),
-            nn.Linear(512*2, 512 * 2)
-        )
+class ResidualBlock1d(nn.Module):
+    """Conv -> FiLM -> Conv, with a residual skip. Works in (B, C, L)."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.out_ch = out_ch
         self.conv1 = nn.Sequential(
-            nn.Conv1d(512, 512, kernel_size=5, padding='same'),
-            nn.GroupNorm(64, 512),
+            nn.Conv1d(in_ch, out_ch, kernel_size=5, padding='same'),
+            nn.GroupNorm(8, out_ch),
             nn.Mish(),
         )
         self.conv2 = nn.Sequential(
-            nn.Conv1d(512, 512, kernel_size=5, padding='same'),
-            nn.GroupNorm(64, 512),
+            nn.Conv1d(out_ch, out_ch, kernel_size=5, padding='same'),
+            nn.GroupNorm(8, out_ch),
             nn.Mish(),
         )
-        self.norm = nn.LayerNorm(512)
+        # FiLM: cond = [state, timestep, img_embed] = 512 + 128 + 512 = 1152
+        self.cond_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(512+128+512, out_ch * 2),
+        )
+        self.residual_conv = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, actions, state, timestep, img_embed):
-        # conv path works in (B, C, L)
-        x = actions.transpose(1, 2)                 # (B, 512, L)
-        x = x + self.conv1(x)
-        actions = x.transpose(1, 2)                 # back to (B, L, 512)
+    def forward(self, x, cond):
+        # x: (B, C, L), cond: (B, 1152)
+        out = self.conv1(x)
+        gamma, beta = self.cond_encoder(cond).unsqueeze(-1).chunk(2, dim=1)  # (B, out_ch, 1) each
+        out = gamma * out + beta
+        out = self.conv2(out)
+        return out + self.residual_conv(x)
 
-        # FiLM / LayerNorm path works in (B, L, C)
-        cond = torch.concat([state, timestep, img_embed], -1)
-        gamma, scale = self.mlp_gamma_scale(cond).chunk(2, -1)
-        actions = actions + self.norm(actions) * scale[:, None] + gamma[:, None]
 
-        x = actions.transpose(1, 2)
-        x = x + self.conv2(x)
-        return x.transpose(1, 2)
-        
+class ConditionalUNet1d(nn.Module):
+    """1D UNet over the action-time axis with FiLM conditioning and skip connections."""
+    def __init__(self):
+        super().__init__()
+        dims = [6, 256, 512, 1024]
+        in_out = list(zip(dims[:-1], dims[1:]))  # [(6,256), (256,512), (512,1024)]
+
+        # encoder: each level = 2 res blocks + a stride-2 downsample (except the last level)
+        self.down_modules = nn.ModuleList([])
+        for i, (din, dout) in enumerate(in_out):
+            is_last = i >= len(in_out) - 1
+            self.down_modules.append(nn.ModuleList([
+                ResidualBlock1d(din, dout),
+                ResidualBlock1d(dout, dout),
+                nn.Conv1d(dout, dout, 3, 2, 1) if not is_last else nn.Identity(),
+            ]))
+
+        self.mid_modules = nn.ModuleList([
+            ResidualBlock1d(1024, 1024),
+            ResidualBlock1d(1024, 1024),
+        ])
+
+        # decoder: takes the encoder skip (hence din*2) + a stride-2 upsample
+        self.up_modules = nn.ModuleList([])
+        for i, (dout, din) in enumerate(reversed(in_out[1:])):  # [(512,1024), (256,512)]
+            is_last = i >= len(in_out) - 1
+            self.up_modules.append(nn.ModuleList([
+                ResidualBlock1d(din * 2, dout),
+                ResidualBlock1d(dout, dout),
+                nn.ConvTranspose1d(dout, dout, 4, 2, 1) if not is_last else nn.Identity(),
+            ]))
+
+        self.final_conv = nn.Sequential(
+            nn.Conv1d(256, 256, kernel_size=5, padding='same'),
+            nn.GroupNorm(8, 256),
+            nn.Mish(),
+            nn.Conv1d(256, 6, 1),
+        )
+
+    def forward(self, x, cond):
+        # x: (B, L, 6), cond: (B, 1152)
+        x = x.transpose(1, 2)                       # (B, 6, L)
+        skips = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, cond)
+            x = resnet2(x, cond)
+            skips.append(x)
+            x = downsample(x)
+
+        for m in self.mid_modules:
+            x = m(x, cond)
+
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat([x, skips.pop()], dim=1)  # concat encoder skip on channels
+            x = resnet(x, cond)
+            x = resnet2(x, cond)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+        return x.transpose(1, 2)                     # (B, L, 6)
+
+
 class SpatialSoftmax(nn.Module):
     def __init__(self, in_channels, num_kp=32, temperature=1.0, feature_dim=64):
         super().__init__()

@@ -48,7 +48,7 @@ class RoPE(nn.Module):
 class Attention(nn.Module):
     """Multi-head self-attention with RoPE, optionally cross-attention."""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, skip_rope=False):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -59,7 +59,9 @@ class Attention(nn.Module):
         self.v = nn.Linear(d_model, d_model)
         self.out = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.rope = RoPE(self.d_head)
+        self.skip_rope = skip_rope
+        if not skip_rope:
+            self.rope = RoPE(self.d_head)
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         # (B, T, D) -> (B, n_heads, T, d_head)
@@ -88,8 +90,9 @@ class Attention(nn.Module):
         v = self._split_heads(self.v(kv_src))   # (B, H, S, d_head)
 
         # Apply RoPE to q and k along the head dimension
-        q = self.rope(q.flatten(0, 1)).view(B, self.n_heads, -1, self.d_head)
-        k = self.rope(k.flatten(0, 1)).view(B, self.n_heads, -1, self.d_head)
+        if not self.skip_rope:
+            q = self.rope(q.flatten(0, 1)).view(B, self.n_heads, -1, self.d_head)
+            k = self.rope(k.flatten(0, 1)).view(B, self.n_heads, -1, self.d_head)
 
         scale = math.sqrt(self.d_head)
         attn = (q @ k.transpose(-2, -1)) / scale  # (B, H, T, S)
@@ -120,7 +123,7 @@ class TransformerLayer(nn.Module):
 
         self.cross_attention = cross_attention
         if cross_attention:
-            self.cross_attn = Attention(d_model, n_heads, dropout)
+            self.cross_attn = Attention(d_model, n_heads, dropout, skip_rope=True)
             self.norm_cross = nn.LayerNorm(d_model)
 
         self.ff = nn.Sequential(
@@ -149,3 +152,5 @@ class TransformerLayer(nn.Module):
         # FFN (pre-norm)
         x = x + self.ff(self.norm2(x))
         return x
+
+
