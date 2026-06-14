@@ -150,7 +150,7 @@ class ActQasimPolicy(PreTrainedPolicy):
                 ActEncoderLayer(512, 8, 1576),
             )
         self.transformer_decoder = nn.ModuleList([
-            TransformerLayer(512, 8, 1576, cross_attention=True) for _ in range(2)
+            TransformerLayer(512, 8, 3072, cross_attention=True) for _ in range(1)
         ])
         self.action_embeds = nn.Parameter(torch.randn(self.config.chunk_size, 512))
         self.action_in_proj = nn.Linear(6, 512)
@@ -219,7 +219,7 @@ class ActQasimPolicy(PreTrainedPolicy):
         assert img_feats.shape[1:] == (300, 512)
         img_feats = self.img_feat_proj(img_feats)
         
-        z_mean, log_sigma_x2_hat = self.cvae(state, actions)
+        z_mean, log_sigma_x2_hat = self.cvae(state, actions, batch.get("action_is_pad"))
         if not use_mean:
             z = torch.distributions.Normal(z_mean, log_sigma_x2_hat.div(2).exp()).rsample()
         else:
@@ -257,19 +257,29 @@ class CVAE(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.cls_token = nn.Parameter(torch.randn(512), True)
-        self.transformer_layers  = nn.Sequential(
-            TransformerLayer2D(512, 8, 1576),
-            TransformerLayer2D(512, 8, 1576),
-            TransformerLayer2D(512, 8, 1576),
-            TransformerLayer2D(512, 8, 1576),
-        )
+        self.transformer_layers = nn.ModuleList([
+            TransformerLayer(512, 8, 1576),
+            TransformerLayer(512, 8, 1576),
+            TransformerLayer(512, 8, 1576),
+            TransformerLayer(512, 8, 1576),
+        ])
         self.final_proj = nn.Linear(512, 64)
         # self.register_buffer("cls_token", cls_token)
-    
-    def forward(self, state, actions):
+
+    def forward(self, state, actions, action_is_pad=None):
         B = state.shape[0]
         x = torch.concat([self.cls_token[None, None].expand(B, 1, -1), state[:, None], actions], 1)
-        x = self.transformer_layers(x)
+
+        # Mask out action tokens that are padding (episode ended early) so they don't
+        # corrupt the latent. The cls and state tokens (first two) are never padded.
+        self_mask = None
+        if action_is_pad is not None:
+            cls_state_pad = torch.zeros(B, 2, dtype=torch.bool, device=action_is_pad.device)
+            key_padding_mask = torch.cat([cls_state_pad, action_is_pad], dim=1)  # (B, 2 + chunk)
+            self_mask = key_padding_mask[:, None, None, :]  # (B, 1, 1, S), True = ignore
+
+        for layer in self.transformer_layers:
+            x = layer(x, self_mask=self_mask)
         z_mean, log_sigma_x2_hat = torch.split(self.final_proj(x[:, 0]), 32, 1)
         return z_mean, log_sigma_x2_hat
         
