@@ -142,6 +142,7 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
+            self._queues[ACTION].clear()
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()
