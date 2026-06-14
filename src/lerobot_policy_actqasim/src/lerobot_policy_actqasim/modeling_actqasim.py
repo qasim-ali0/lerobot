@@ -193,9 +193,9 @@ class ActQasimPolicy(PreTrainedPolicy):
 
     def select_action(self, batch: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         """Return a single action for the current timestep (called at inference)."""
-        
-        action_chunk = self.predict_action_chunk(batch)
-        action = self.temporal_ensembler.update(action_chunk)
+        with torch.no_grad():
+            action_chunk = self.predict_action_chunk(batch)
+            action = self.temporal_ensembler.update(action_chunk)
         return action
 
     def forward(self, batch: dict[str, torch.Tensor], use_mean=False) -> tuple[torch.Tensor, dict]:
