@@ -12,6 +12,120 @@ from lerobot.utils.constants import ACTION, OBS_STATE, OBS_IMAGES
 from .configuration_actqasim import ActQasimConfig
 from .blocks import *
 
+
+
+class AttentionEncoder(nn.Module):
+    """Multi-head self-attention with RoPE, optionally cross-attention."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+
+        self.q = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(d_model, d_model)
+        self.v = nn.Linear(d_model, d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RoPE2D(self.d_head)
+        self.norm1 = nn.LayerNorm(d_model)
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, T, D) -> (B, n_heads, T, d_head)
+        B, T, _ = x.shape
+        return x.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+    def forward(
+        self,
+        img_feats: torch.Tensor, 
+        state: torch.Tensor, 
+        z: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:       (B, T, D) query input
+            context: (B, S, D) key/value source — if None, self-attention
+            mask:    (B, 1, T, S) or broadcastable boolean mask (True = ignore)
+        Returns:
+            (B, T, D)
+        """
+        img_feats_og, state_og, z_og = img_feats, state, z
+        img_feats, state, z = self.norm1(img_feats), self.norm1(state), self.norm1(z)
+        B, T, _ = img_feats.shape
+        q_img = self.q(img_feats)
+        k_img = self.k(img_feats)
+        v_img = self.v(img_feats)
+        rows = (torch.arange(T, device=img_feats.device) // 20).float()  # (300,)
+        cols = (torch.arange(T, device=img_feats.device) %  20).float()  # (300,)
+        q_img = self.rope(self._split_heads(q_img), rows, cols)
+        k_img = self.rope(self._split_heads(k_img), rows, cols)
+        v_img = self._split_heads(self.v(img_feats))
+        
+        q_state = self.q(state)
+        k_state = self.k(state)
+        v_state = self.v(state)
+        q_z = self.q(z)
+        k_z = self.k(z)
+        v_z = self.v(z)
+        
+        q = torch.concat([q_img, self._split_heads(q_state[:, None]), self._split_heads(q_z[:, None])], 2)
+        k = torch.concat([k_img, self._split_heads(k_state[:, None]), self._split_heads(k_z[:, None])], 2)
+        v = torch.concat([v_img, self._split_heads(v_state[:, None]), self._split_heads(v_z[:, None])], 2)
+        B, _, T, _ = q.shape
+
+        scale = math.sqrt(self.d_head)
+        attn = (q @ k.transpose(-2, -1)) / scale  # (B, H, T, S)
+
+        attn = self.dropout(F.softmax(attn, dim=-1))
+        out = attn @ v                            # (B, H, T, d_head)
+        out = out.transpose(1, 2).reshape(B, T, -1)
+        out = self.out(out)
+        img_feats, state, z = out[:, :-2], out[:, -2].squeeze(1), out[:, -1].squeeze(1)
+        return img_feats_og + img_feats, state_og + state, z_og + z
+
+
+class ActEncoderLayer(nn.Module):
+    """Pre-norm transformer layer: self-attention + optional cross-attention + FFN."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.self_attn = AttentionEncoder(d_model, n_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        img_feats,
+        state,
+        z,
+    ) -> torch.Tensor:
+                
+        img_feats, state, z = self.self_attn(img_feats, state, z)
+
+        # FFN (pre-norm)
+        img_feats = img_feats + self.ff(self.norm2(img_feats))
+        state = state + self.ff(self.norm2(state))
+        z = z + self.ff(self.norm2(z))
+        return img_feats, state, z
+
+
+
+
 class ActQasimPolicy(PreTrainedPolicy):
     config_class = ActQasimConfig
     name = "actqasim"
@@ -30,14 +144,13 @@ class ActQasimPolicy(PreTrainedPolicy):
         self.cvae = CVAE()
         self.img_feat_proj = nn.Linear(512, 512)
         self.transformer_encoder = nn.Sequential(
-            
-                TransformerLayer(512, 8, 1024),
-                TransformerLayer(512, 8, 1024),
-                TransformerLayer(512, 8, 1024),
-                TransformerLayer(512, 8, 1024),
+                ActEncoderLayer(512, 8, 1576),
+                ActEncoderLayer(512, 8, 1576),
+                ActEncoderLayer(512, 8, 1576),
+                ActEncoderLayer(512, 8, 1576),
             )
         self.transformer_decoder = nn.ModuleList([
-            TransformerLayer(512, 8, 1024, cross_attention=True) for _ in range(7)
+            TransformerLayer(512, 8, 1576, cross_attention=True) for _ in range(2)
         ])
         self.action_embeds = nn.Parameter(torch.randn(self.config.chunk_size, 512))
         self.action_in_proj = nn.Linear(6, 512)
@@ -68,9 +181,11 @@ class ActQasimPolicy(PreTrainedPolicy):
         img_feats = self.img_feat_proj(img_feats)
 
         z = torch.zeros(B, 32, device=state.device, dtype=state.dtype)
-        x = torch.concat([img_feats, state[:, None], self.z_proj(z)[:, None]], 1)
-
-        x = self.transformer_encoder(x)
+        # 
+        z = self.z_proj(z)
+        for layer in self.transformer_encoder:
+            img_feats, state, z = layer(img_feats, state, z)
+        x = torch.concat([img_feats, state[:, None], z[:, None]], 1)
         action_embeds = self.action_embeds.unsqueeze(0).expand(B, -1, -1)
         for layer in self.transformer_decoder:
             action_embeds = layer(action_embeds, context=x)
@@ -81,7 +196,7 @@ class ActQasimPolicy(PreTrainedPolicy):
         
         action_chunk = self.predict_action_chunk(batch)
         action = self.temporal_ensembler.update(action_chunk)
-        return action_chunk[:, 0]
+        return action
 
     def forward(self, batch: dict[str, torch.Tensor], use_mean=False) -> tuple[torch.Tensor, dict]:
         """Compute the training loss.
@@ -108,10 +223,15 @@ class ActQasimPolicy(PreTrainedPolicy):
         if not use_mean:
             z = torch.distributions.Normal(z_mean, log_sigma_x2_hat.div(2).exp()).rsample()
         else:
-            z= z_mean
-        x = torch.concat([img_feats, state[:, None], self.z_proj(z)[:, None]], 1)
+            z = z_mean
+        # x = torch.concat([img_feats, state[:, None], self.z_proj(z)[:, None]], 1)
         
-        x = self.transformer_encoder(x)
+        z = self.z_proj(z)
+        for layer in self.transformer_encoder:
+            img_feats, state, z = layer(img_feats, state, z)
+        x = torch.concat([img_feats, state[:, None], z[:, None]], 1)
+        
+        # x = self.transformer_encoder(x)
         action_embeds = self.action_embeds.unsqueeze(0).expand(B, -1, -1)
         for layer in self.transformer_decoder:
             action_embeds = layer(action_embeds, context=x)
@@ -138,10 +258,10 @@ class CVAE(nn.Module):
         super().__init__(*args, **kwargs)
         self.cls_token = nn.Parameter(torch.randn(512), True)
         self.transformer_layers  = nn.Sequential(
-            TransformerLayer(512, 8, 1024),
-            TransformerLayer(512, 8, 1024),
-            TransformerLayer(512, 8, 1024),
-            TransformerLayer(512, 8, 1024),
+            TransformerLayer2D(512, 8, 1576),
+            TransformerLayer2D(512, 8, 1576),
+            TransformerLayer2D(512, 8, 1576),
+            TransformerLayer2D(512, 8, 1576),
         )
         self.final_proj = nn.Linear(512, 64)
         # self.register_buffer("cls_token", cls_token)
@@ -159,11 +279,10 @@ class ACTTemporalEnsembler:
         self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
         self.reset()
-        self.absolute_time = 0
     
     def reset(self):
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
-    
+        self.absolute_time = 0
     def update(self, action_chunk):
         if self.absolute_time == 0:
             self.ensembled_actions = action_chunk[:, 1:].clone()

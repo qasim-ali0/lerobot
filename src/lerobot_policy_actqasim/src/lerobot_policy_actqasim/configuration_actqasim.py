@@ -32,8 +32,8 @@ class ActQasimConfig(PreTrainedConfig):
     n_action_steps: int = 100
     replace_final_stride_with_dilation: int = False
 
-    optimizer_lr: float = 1e-4
-    optimizer_weight_decay: float = 1e-4
+    optimizer_lr: float = 4e-5
+    optimizer_weight_decay: float = 4e-5
 
     def __post_init__(self):
         super().__post_init__()
