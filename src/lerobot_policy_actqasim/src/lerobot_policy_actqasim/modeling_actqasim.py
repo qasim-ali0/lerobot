@@ -150,14 +150,14 @@ class ActQasimPolicy(PreTrainedPolicy):
                 ActEncoderLayer(512, 8, 1576),
             )
         self.transformer_decoder = nn.ModuleList([
-            TransformerLayer(512, 8, 3072, cross_attention=True) for _ in range(1)
+            TransformerLayer(512, 8, 1576, cross_attention=True) for _ in range(2)
         ])
         self.action_embeds = nn.Parameter(torch.randn(self.config.chunk_size, 512))
         self.action_in_proj = nn.Linear(6, 512)
         self.state_proj = nn.Linear(6, 512)
         self.z_proj = nn.Linear(32, 512)
         self.action_out_proj = nn.Linear(512, 6)
-        self.temporal_ensembler = ACTTemporalEnsembler(0.01, config.chunk_size)
+        self.temporal_ensembler = ACTTemporalEnsembler(0.00, config.chunk_size)
         self.reset()
         
     def reset(self):
