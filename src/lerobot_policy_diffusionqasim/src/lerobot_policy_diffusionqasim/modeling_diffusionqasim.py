@@ -36,7 +36,7 @@ class DiffusionQasimPolicy(PreTrainedPolicy):
             nn.Mish(),
             nn.Linear(128 * 4, 128),     # 1024 → 256
         )
-        self.T = 16
+        self.T = 32
         self.unet = ConditionalUNet1d()
         self.spatial_softmax = SpatialSoftmax(512, feature_dim=512)
         
