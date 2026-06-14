@@ -29,7 +29,7 @@ class ActQasimConfig(PreTrainedConfig):
     # hidden_dim: int = 256
     n_obs_steps: int = 1
     chunk_size: int = 100
-    n_action_steps: int = 32
+    n_action_steps: int = 100
     replace_final_stride_with_dilation: int = False
 
     optimizer_lr: float = 1e-5
