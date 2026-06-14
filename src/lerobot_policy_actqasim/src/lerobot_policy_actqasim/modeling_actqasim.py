@@ -159,13 +159,13 @@ class ActQasimPolicy(PreTrainedPolicy):
         self.cvae = CVAE()
         self.img_feat_proj = nn.Linear(512, 512)
         self.transformer_encoder = nn.Sequential(
-                ActEncoderLayer(512, 8, 1576),
-                ActEncoderLayer(512, 8, 1576),
-                ActEncoderLayer(512, 8, 1576),
-                ActEncoderLayer(512, 8, 1576),
+                ActEncoderLayer(512, 8, 3072),
+                ActEncoderLayer(512, 8, 3072),
+                ActEncoderLayer(512, 8, 3072),
+                ActEncoderLayer(512, 8, 3072),
             )
         self.transformer_decoder = nn.ModuleList([
-            TransformerLayer(512, 8, 1576, cross_attention=True) for _ in range(1)
+            TransformerLayer(512, 8, 3072, cross_attention=True) for _ in range(1)
         ])
         self.action_embeds = nn.Parameter(torch.randn(self.config.chunk_size, 512))
         self.action_in_proj = nn.Linear(6, 512)
@@ -282,10 +282,10 @@ class CVAE(nn.Module):
         super().__init__(*args, **kwargs)
         self.cls_token = nn.Parameter(torch.randn(512), True)
         self.transformer_layers = nn.ModuleList([
-            TransformerLayer(512, 8, 1576),
-            TransformerLayer(512, 8, 1576),
-            TransformerLayer(512, 8, 1576),
-            TransformerLayer(512, 8, 1576),
+            TransformerLayer(512, 8, 3072),
+            TransformerLayer(512, 8, 3072),
+            TransformerLayer(512, 8, 3072),
+            TransformerLayer(512, 8, 3072),
         ])
         self.final_proj = nn.Linear(512, 64)
         # self.register_buffer("cls_token", cls_token)
