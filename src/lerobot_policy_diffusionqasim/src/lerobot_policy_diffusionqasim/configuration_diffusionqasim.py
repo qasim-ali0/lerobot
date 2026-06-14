@@ -28,7 +28,7 @@ class DiffusionQasimConfig(PreTrainedConfig):
     # hidden_dim: int = 256
     n_obs_steps: int = 1
     chunk_size: int = 100
-    n_action_steps: int = 50
+    n_action_steps: int = 32
     replace_final_stride_with_dilation: bool = False
 
     optimizer_lr: float = 1e-4
